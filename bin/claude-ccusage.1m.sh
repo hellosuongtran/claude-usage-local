@@ -53,11 +53,21 @@ def col(pct):
 def short(name):
     return name.replace("claude-", "").split("-2025")[0]
 
+# effective tokens = input + output + cache-create (EXCLUDES cache-read,
+# which Anthropic barely counts toward rate limits — keeps % closer to real).
+def eff_block(b):
+    tc = b.get("tokenCounts", {})
+    return tc.get("inputTokens",0)+tc.get("outputTokens",0)+tc.get("cacheCreationInputTokens",0)
+def eff_day(d):
+    return d.get("inputTokens",0)+d.get("outputTokens",0)+d.get("cacheCreationTokens",0)
+def eff_model(m):
+    return m.get("inputTokens",0)+m.get("outputTokens",0)+m.get("cacheCreationTokens",0)
+
 # ── 5h BLOCK ──
 blocks = bdata.get("blocks", [])
-completed = [b["totalTokens"] for b in blocks
-             if not b.get("isActive") and not b.get("isGap") and b.get("totalTokens")]
-BLOCK_LIMIT = max(completed) if completed else 43_000_000
+completed = [eff_block(b) for b in blocks
+             if not b.get("isActive") and not b.get("isGap") and eff_block(b)>0]
+BLOCK_LIMIT = max(completed) if completed else 2_000_000
 active = next((b for b in blocks if b.get("isActive")), None)
 
 # ── notify on a NEW 5h block (usage reset) ──
@@ -81,7 +91,7 @@ if cur_id:
 
 # ── WEEK (rolling 7 days) ──
 daily = ddata.get("daily", [])
-day_tot = [d.get("totalTokens", 0) for d in daily]
+day_tot = [eff_day(d) for d in daily]
 week_used = sum(day_tot[-7:])
 WEEK_LIMIT = max((sum(day_tot[i:i+7]) for i in range(max(1, len(day_tot)-6))), default=week_used) or week_used
 week_pct = 100*week_used/WEEK_LIMIT if WEEK_LIMIT else 0
@@ -89,31 +99,31 @@ week_pct = 100*week_used/WEEK_LIMIT if WEEK_LIMIT else 0
 wm = defaultdict(lambda: [0, 0.0])
 for d in daily[-7:]:
     for m in d.get("modelBreakdowns", []):
-        t = m["inputTokens"]+m["outputTokens"]+m["cacheCreationTokens"]+m["cacheReadTokens"]
-        wm[m["modelName"]][0] += t; wm[m["modelName"]][1] += m["cost"]
+        wm[m["modelName"]][0] += eff_model(m); wm[m["modelName"]][1] += m["cost"]
 tm = defaultdict(lambda: [0, 0.0])
 if daily:
     for m in daily[-1].get("modelBreakdowns", []):
-        t = m["inputTokens"]+m["outputTokens"]+m["cacheCreationTokens"]+m["cacheReadTokens"]
-        tm[m["modelName"]][0] += t; tm[m["modelName"]][1] += m["cost"]
+        tm[m["modelName"]][0] += eff_model(m); tm[m["modelName"]][1] += m["cost"]
 
 # ── block figures + time-through-window ──
 now = datetime.datetime.now(datetime.timezone.utc)
 if active:
-    used = active.get("totalTokens", 0)
+    used = eff_block(active)
     b_pct = 100*used/BLOCK_LIMIT if BLOCK_LIMIT else 0
-    tpm = (active.get("burnRate") or {}).get("tokensPerMinute", 0) or 0
+    elapsed_min = 1
     try:
         st = datetime.datetime.fromisoformat(active["startTime"].replace("Z","+00:00"))
         en = datetime.datetime.fromisoformat(active["endTime"].replace("Z","+00:00"))
         span = (en-st).total_seconds()
+        elapsed_min = max(1, (now-st).total_seconds()/60)
         t_pct = 100*max(0,(now-st).total_seconds())/span if span else 0
         secs = max(0, int((en-now).total_seconds()))
         remaining = f"{secs//3600}h{(secs%3600)//60:02d}m"; local_end = en.astimezone().strftime("%H:%M")
     except Exception:
         t_pct=0; secs=0; remaining="?"; local_end="?"
+    tpm = used/elapsed_min  # effective tokens/min, consistent with the % above
     rem = max(0, BLOCK_LIMIT-used)
-    hits = tpm>0 and (rem/tpm*60) < secs
+    hits = tpm>0 and (rem/tpm) < (secs/60)
     eta_min = int(rem/tpm) if tpm>0 else 0
 else:
     used=b_pct=tpm=t_pct=secs=0; remaining="—"; local_end="—"; hits=False; eta_min=0
