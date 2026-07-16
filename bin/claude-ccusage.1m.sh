@@ -1,8 +1,8 @@
 #!/bin/bash
-# Claude Usage (local) — SwiftBar plugin backed by ccusage.
-# Reads local ~/.claude logs. No API call, so NEVER rate-limited.
-# Design inspired by github.com/hohieuu/ai-usage-bar (dual usage/time bars).
-# Fires a macOS notification when a new 5h block starts (usage reset).
+# Claude Usage — SwiftBar plugin.
+# Primary: official /api/oauth/usage (REAL 5h/7d % that matches `/usage`),
+#   with self-refreshing OAuth token (login once) + 15-min response cache.
+# Fallback: local ccusage estimate if not logged in.
 # <swiftbar.title>Claude Usage</swiftbar.title>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
@@ -17,168 +17,197 @@ command -v "$CCUSAGE" >/dev/null 2>&1 || CCUSAGE="npx -y ccusage@latest"
 if [ "${1:-}" = "--live" ]; then
   exec $CCUSAGE blocks --live
 fi
+FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
 
-BLOCKS_JSON=$($CCUSAGE blocks --json 2>/dev/null)
 DAILY_JSON=$($CCUSAGE daily --json --breakdown 2>/dev/null)
 
-python3 - "$BLOCKS_JSON" "$DAILY_JSON" "$0" <<'PY'
-import sys, json, datetime, os, subprocess
-from collections import defaultdict
+FORCE="$FORCE" python3 - "$DAILY_JSON" "$0" <<'PY'
+import sys, json, os, time, datetime, subprocess
 
-def load(s):
-    try: return json.loads(s)
-    except Exception: return None
+DAILY = sys.argv[1]; SELF = sys.argv[2]
+FORCE = os.environ.get("FORCE") == "1"
+DIR   = os.path.expanduser("~/.claude-usage-bar"); os.makedirs(DIR, exist_ok=True)
+CACHE = os.path.join(DIR, "usage-cache.json")
+LOCK  = os.path.join(DIR, "refresh.lock")
+NOTE  = os.path.join(DIR, "last_reset")
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-bdata = load(sys.argv[1]) or {}
-ddata = load(sys.argv[2]) or {}
-SELF  = sys.argv[3]
-
-# light,dark
 GREEN="#007a29,#30d158"; YELLOW="#b25000,#ffb340"; RED="#c40000,#ff453a"
-DIM="#6b6b6b,#9a9a9a";   BLUE="#0069c0,#5ac8fa"
+DIM="#6b6b6b,#9a9a9a"; BLUE="#0069c0,#5ac8fa"
 
-def fmt(n):
-    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:     return f"{n/1_000:.0f}k"
-    return str(int(n))
-
-def make_bar(pct):
-    p = max(0, min(100, int(round(pct))))
-    f = int(round(p/10))
+def col(p): return GREEN if p < 65 else (YELLOW if p < 90 else RED)
+def make_bar(p):
+    p = max(0, min(100, int(round(p)))); f = int(round(p/10))
     return "█"*f + "░"*(10-f) + f" {p:>3}%"
 
-def col(pct):
-    return GREEN if pct < 65 else (YELLOW if pct < 90 else RED)
-
-def short(name):
-    return name.replace("claude-", "").split("-2025")[0]
-
-# effective tokens = input + output + cache-create (EXCLUDES cache-read,
-# which Anthropic barely counts toward rate limits — keeps % closer to real).
-def eff_block(b):
-    tc = b.get("tokenCounts", {})
-    return tc.get("inputTokens",0)+tc.get("outputTokens",0)+tc.get("cacheCreationInputTokens",0)
-def eff_day(d):
-    return d.get("inputTokens",0)+d.get("outputTokens",0)+d.get("cacheCreationTokens",0)
-def eff_model(m):
-    return m.get("inputTokens",0)+m.get("outputTokens",0)+m.get("cacheCreationTokens",0)
-
-# ── 5h BLOCK ──
-blocks = bdata.get("blocks", [])
-completed = [eff_block(b) for b in blocks
-             if not b.get("isActive") and not b.get("isGap") and eff_block(b)>0]
-BLOCK_LIMIT = max(completed) if completed else 2_000_000
-active = next((b for b in blocks if b.get("isActive")), None)
-
-# ── notify on a NEW 5h block (usage reset) ──
-STATE = os.path.expanduser("~/.claude-usage-bar/last_block_id")
-cur_id = active.get("id") if active else None
-if cur_id:
-    prev = None
-    try: prev = open(STATE).read().strip()
-    except Exception: pass
-    if prev and prev != cur_id:
-        try:
-            subprocess.run(["osascript","-e",
-                'display notification "New 5-hour block started — your usage limit just reset." '
-                'with title "Claude Usage" subtitle "Fresh quota available" sound name "Glass"'],
-                timeout=5)
-        except Exception: pass
+# ---------- OAuth: read keychain, refresh if needed, write back ----------
+def kc_read():
     try:
-        os.makedirs(os.path.dirname(STATE), exist_ok=True)
-        open(STATE,"w").write(cur_id)
-    except Exception: pass
-
-# ── WEEK (rolling 7 days) ──
-daily = ddata.get("daily", [])
-day_tot = [eff_day(d) for d in daily]
-week_used = sum(day_tot[-7:])
-WEEK_LIMIT = max((sum(day_tot[i:i+7]) for i in range(max(1, len(day_tot)-6))), default=week_used) or week_used
-week_pct = 100*week_used/WEEK_LIMIT if WEEK_LIMIT else 0
-
-wm = defaultdict(lambda: [0, 0.0])
-for d in daily[-7:]:
-    for m in d.get("modelBreakdowns", []):
-        wm[m["modelName"]][0] += eff_model(m); wm[m["modelName"]][1] += m["cost"]
-tm = defaultdict(lambda: [0, 0.0])
-if daily:
-    for m in daily[-1].get("modelBreakdowns", []):
-        tm[m["modelName"]][0] += eff_model(m); tm[m["modelName"]][1] += m["cost"]
-
-# ── block figures + time-through-window ──
-now = datetime.datetime.now(datetime.timezone.utc)
-if active:
-    used = eff_block(active)
-    b_pct = 100*used/BLOCK_LIMIT if BLOCK_LIMIT else 0
-    elapsed_min = 1
-    try:
-        st = datetime.datetime.fromisoformat(active["startTime"].replace("Z","+00:00"))
-        en = datetime.datetime.fromisoformat(active["endTime"].replace("Z","+00:00"))
-        span = (en-st).total_seconds()
-        elapsed_min = max(1, (now-st).total_seconds()/60)
-        t_pct = 100*max(0,(now-st).total_seconds())/span if span else 0
-        secs = max(0, int((en-now).total_seconds()))
-        remaining = f"{secs//3600}h{(secs%3600)//60:02d}m"; local_end = en.astimezone().strftime("%H:%M")
+        raw = subprocess.run(["security","find-generic-password","-s","Claude Code-credentials","-w"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return json.loads(raw).get("claudeAiOauth")
     except Exception:
-        t_pct=0; secs=0; remaining="?"; local_end="?"
-    tpm = used/elapsed_min  # effective tokens/min, consistent with the % above
-    rem = max(0, BLOCK_LIMIT-used)
-    hits = tpm>0 and (rem/tpm) < (secs/60)
-    eta_min = int(rem/tpm) if tpm>0 else 0
-else:
-    used=b_pct=tpm=t_pct=secs=0; remaining="—"; local_end="—"; hits=False; eta_min=0
+        return None
 
-# ── header state ──
-if not active:
-    head, hc = "idle", DIM
-elif b_pct>=90 or hits:
-    head, hc = "Hold — near cap", RED
-elif b_pct>=65:
-    head, hc = "Slow down", YELLOW
-elif b_pct > t_pct + 15:
-    head, hc = "Burning fast", YELLOW
-else:
-    head, hc = "Plenty left", GREEN
+def kc_write(o):
+    try:
+        creds = {"claudeAiOauth": o}
+        subprocess.run(["security","add-generic-password","-U","-s","Claude Code-credentials",
+                        "-a", os.environ.get("USER","")], input=json.dumps(creds),
+                       capture_output=True, text=True, timeout=5, check=True)
+        return True
+    except Exception:
+        return False
 
-# ===== menu bar =====
-mb_col = RED if (b_pct>=90 or hits) else (YELLOW if max(b_pct,week_pct)>=65 else GREEN)
-if active:
-    print(f"⛁ {b_pct:.0f}% · {remaining} | font=Menlo-Bold size=13 color={mb_col}")
-else:
-    print(f"⛁ idle | font=Menlo-Bold size=13 color={DIM}")
+def refresh(o):
+    # single-use refresh token → must persist the rotated one immediately
+    body = json.dumps({"grant_type":"refresh_token","refresh_token":o["refreshToken"],
+                       "client_id":CLIENT_ID})
+    p = subprocess.run(["curl","-s","--max-time","12","-X","POST",
+        "https://api.anthropic.com/v1/oauth/token",
+        "-H","Content-Type: application/json","-d", body], capture_output=True, text=True)
+    d = json.loads(p.stdout)
+    if "access_token" not in d:
+        raise RuntimeError("refresh failed: " + p.stdout[:200])
+    o["accessToken"]  = d["access_token"]
+    o["refreshToken"] = d.get("refresh_token", o["refreshToken"])
+    o["expiresAt"]    = int((time.time() + d.get("expires_in", 28800)) * 1000)
+    kc_write(o)
+    return o
 
-# ===== dropdown =====
-print("---")
-print(f"Claude Usage · {head} | font=Menlo-Bold size=12 color={hc}")
+def get_token():
+    o = kc_read()
+    if not o or "accessToken" not in o:
+        return None, "not_logged_in"
+    if o.get("expiresAt", 0)/1000 > time.time() + 120:
+        return o["accessToken"], "ok"
+    # expired/near — refresh under a soft lock (avoid concurrent double-refresh)
+    try:
+        if os.path.exists(LOCK) and time.time() - os.path.getmtime(LOCK) < 30:
+            return o["accessToken"], "ok"   # another run is refreshing; use current
+        open(LOCK,"w").write("1")
+        o = refresh(o)
+        return o["accessToken"], "ok"
+    except Exception:
+        return o.get("accessToken"), "refresh_failed"
 
-if active:
-    print(f"  5h  {make_bar(b_pct)} | font=Menlo size=12 color={col(b_pct)}")
-    print(f"  ⏱   {make_bar(t_pct)} | font=Menlo size=12 color={BLUE}")
-    print(f"  {fmt(used)} / {fmt(BLOCK_LIMIT)} tok | font=Menlo size=11 color={DIM}")
-    if hits:
-        eh,em = eta_min//60, eta_min%60
-        print(f"  Reset {remaining} · {local_end}  ⚠️ cap in ~{eh}h{em:02d}m | font=Menlo size=11 color={RED}")
+def fetch_usage(token):
+    p = subprocess.run(["curl","-s","--max-time","10",
+        "-H",f"Authorization: Bearer {token}","-H","anthropic-beta: oauth-2025-04-20",
+        "-H","Content-Type: application/json",
+        "https://api.anthropic.com/api/oauth/usage"], capture_output=True, text=True)
+    d = json.loads(p.stdout)
+    if "five_hour" not in d:
+        raise RuntimeError("usage failed: " + p.stdout[:200])
+    return d
+
+def load_cache():
+    try:
+        c = json.load(open(CACHE))
+        return c["data"], time.time() - c["ts"]
+    except Exception:
+        return None, 1e9
+
+# ---------- get usage (cache 15 min) ----------
+data = None; age = 1e9; state = "ok"
+token, tstate = get_token()
+if tstate == "ok" and token:
+    data, age = load_cache()
+    if FORCE or data is None or age > 900:
+        try:
+            data = fetch_usage(token)
+            json.dump({"ts": time.time(), "data": data}, open(CACHE,"w"))
+            age = 0
+        except Exception:
+            if data is None: state = "fetch_failed"
     else:
-        print(f"  Reset {remaining} · {local_end} | font=Menlo size=11 color={DIM}")
+        state = "cached"
 else:
-    print(f"  5h  no active session | font=Menlo size=12 color={DIM}")
+    state = tstate
 
-print(f"  7d  {make_bar(week_pct)} | font=Menlo size=12 color={col(week_pct)}")
-print(f"  {fmt(week_used)} / {fmt(WEEK_LIMIT)} tok · rolling | font=Menlo size=11 color={DIM}")
+def fmt_reset(iso):
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+        now = datetime.datetime.now(dt.tzinfo)
+        secs = max(0, int((dt-now).total_seconds()))
+        d,h,m = secs//86400, (secs%86400)//3600, (secs%3600)//60
+        cd = (f"{d}d {h}h" if d else (f"{h}h{m:02d}m" if h else f"{m}m"))
+        return cd, dt.astimezone().strftime("%a %H:%M" if d else "%H:%M"), secs
+    except Exception:
+        return "?", "?", 0
+def time_pct(iso, window_h):
+    _,_,secs = fmt_reset(iso)
+    return max(0, min(100, 100*(window_h*3600 - secs)/(window_h*3600)))
 
-# ===== per-model =====
+# ================= OFFICIAL DATA PATH =================
+if data and isinstance(data, dict) and data.get("five_hour"):
+    five = data.get("five_hour") or {}
+    week = data.get("seven_day") or {}
+    fp = float(five.get("utilization") or 0)
+    wp = float(week.get("utilization") or 0)
+    f_cd, f_at, f_secs = fmt_reset(five.get("resets_at",""))
+    w_cd, w_at, w_secs = fmt_reset(week.get("resets_at",""))
+    ftp = time_pct(five.get("resets_at",""), 5)
+    wtp = time_pct(week.get("resets_at",""), 168)
+
+    # per-model weekly (scoped limits)
+    scoped = []
+    for lim in data.get("limits", []):
+        if lim.get("kind") == "weekly_scoped" and lim.get("scope",{}).get("model",{}).get("display_name"):
+            scoped.append((lim["scope"]["model"]["display_name"], float(lim.get("percent") or 0)))
+
+    # reset notification when the 5h window rolls over
+    try:
+        prev = open(NOTE).read().strip()
+    except Exception:
+        prev = ""
+    if five.get("resets_at") and prev and prev != five["resets_at"]:
+        subprocess.run(["osascript","-e",
+            'display notification "5-hour limit reset — fresh quota." with title "Claude Usage" sound name "Glass"'],
+            timeout=5)
+    if five.get("resets_at"):
+        try: open(NOTE,"w").write(five["resets_at"])
+        except Exception: pass
+
+    burning = fp > ftp + 15
+    head = ("🛑 Hold" if fp>=90 else "⚠️ Slow down" if fp>=65 else
+            "⚡ Burning fast" if burning else "✅ Plenty left")
+    hc = YELLOW if (burning and fp<65) else col(fp)
+
+    print(f"⛁ {fp:.0f}% · {f_cd} | font=Menlo-Bold size=13 color={col(fp)}")
+    print("---")
+    tag = "" if state=="ok" else ("  · cached" if state=="cached" else "")
+    print(f"Claude Usage · {head}{tag} | font=Menlo-Bold size=12 color={hc}")
+    print(f"  5h  {make_bar(fp)} | font=Menlo size=12 color={col(fp)}")
+    print(f"  ⏱   {make_bar(ftp)} | font=Menlo size=12 color={BLUE}")
+    print(f"  Resets {f_cd} · {f_at} | font=Menlo size=11 color={DIM}")
+    print(f"  7d  {make_bar(wp)} | font=Menlo size=12 color={col(wp)}")
+    print(f"  ⏱   {make_bar(wtp)} | font=Menlo size=12 color={BLUE}")
+    print(f"  Resets {w_cd} · {w_at} | font=Menlo size=11 color={DIM}")
+    if scoped:
+        print("---")
+        print(f"Weekly by model | font=Menlo size=11 color={DIM}")
+        for nm,p in sorted(scoped, key=lambda x:-x[1]):
+            print(f"  {nm:<8} {make_bar(p)} | font=Menlo size=11 color={col(p)}")
+    print("---")
+    print(f"Real % from Anthropic · matches /usage | font=Menlo size=11 color={DIM}")
+    print(f"Refresh | bash='{SELF}' param1=--force terminal=false refresh=true")
+    print(f"Live tokens (Terminal) | bash='{SELF}' param1=--live terminal=true")
+    sys.exit(0)
+
+# ================= FALLBACK (ccusage local) =================
+try: dd = json.loads(DAILY)
+except Exception: dd = {}
+msg = {"not_logged_in":"Not logged in — run: claude login",
+       "refresh_failed":"Token refresh failed — run: claude login",
+       "fetch_failed":"Usage fetch failed (offline?)"}.get(state, "Loading…")
+daily = dd.get("daily", [])
+def eff_day(d): return d.get("inputTokens",0)+d.get("outputTokens",0)+d.get("cacheCreationTokens",0)
+wu = sum(eff_day(d) for d in daily[-7:])
+print(f"⛁ local | font=Menlo-Bold size=13 color={DIM}")
 print("---")
-print(f"Models · 7d | font=Menlo size=11 color={DIM}")
-for name,(t,c) in sorted(wm.items(), key=lambda x:-x[1][0]):
-    print(f"  {short(name):<9} {fmt(t):>6} · ${c:.0f} | font=Menlo size=11 color={DIM}")
-if tm:
-    print(f"Models · today | font=Menlo size=11 color={DIM}")
-    for name,(t,c) in sorted(tm.items(), key=lambda x:-x[1][0]):
-        print(f"  {short(name):<9} {fmt(t):>6} · ${c:.2f} | font=Menlo size=11 color={DIM}")
-
-# ===== bars legend + actions =====
+print(f"{msg} | font=Menlo size=12 color={YELLOW}")
+print(f"Showing local estimate (7d eff): {wu/1e6:.1f}M tok | font=Menlo size=11 color={DIM}")
 print("---")
-print(f"█ used   ⏱ time through window | font=Menlo size=11 color={DIM}")
-print(f"Live view (Terminal) | bash='{SELF}' param1=--live terminal=true")
-print("Refresh | refresh=true")
+print(f"Retry | bash='{SELF}' param1=--force terminal=false refresh=true")
 PY

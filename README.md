@@ -1,8 +1,8 @@
-# Claude Usage (local)
+# Claude Usage
 
-Real-time **Claude Code** usage in your macOS menu bar — **100% local, no API calls, never rate-limited.**
+Real-time **Claude Code** usage in your macOS menu bar — the **exact 5h / 7d percentages that `/usage` shows.**
 
-Reads your local `~/.claude` logs via [ccusage](https://github.com/ryoppippi/ccusage) and renders them through [SwiftBar](https://swiftbar.app). Design inspired by [hohieuu/ai-usage-bar](https://github.com/hohieuu/ai-usage-bar), but rebuilt on local logs so it never hits Anthropic's rate-limited usage endpoint.
+Pulls the official `/api/oauth/usage` endpoint (same numbers as Claude Code's `/usage`) through [SwiftBar](https://swiftbar.app). The OAuth token is **self-refreshing** — you log in once and it keeps itself alive. Responses are cached 15 min so it never gets rate-limited. Falls back to a local [ccusage](https://github.com/ryoppippi/ccusage) estimate if you're not logged in. Design inspired by [hohieuu/ai-usage-bar](https://github.com/hohieuu/ai-usage-bar).
 
 ## Install
 
@@ -19,47 +19,44 @@ bash claude-usage-local/install/install.sh
 
 ## What you see
 
-Menu bar: `⛁ 23% · 2h09m`
+Menu bar: `⛁ 52% · 3h16m`
 
 ```
-Claude Usage · Plenty left
-  5h  ██░░░░░░░░  23%      ← usage this 5h block
-  ⏱   ██████░░░░  57%      ← time elapsed through the window
-  10.0M / 43.5M tok
-  Reset 2h09m · 14:00
-  7d  ███░░░░░░░  26%      ← rolling 7-day usage
-  89.9M / 339.2M tok · rolling
+Claude Usage · ⚡ Burning fast
+  5h  █████░░░░░  52%      ← real session usage (matches /usage)
+  ⏱   ███░░░░░░░  34%      ← time elapsed through the 5h window
+  Resets 3h16m · 16:10
+  7d  █░░░░░░░░░   6%      ← real weekly usage
+  ⏱   ████████░░  76%
+  Resets 1d 16h · Sat 05:00
 ──────────
-Models · 7d
-  fable-5    52.0M · $132
-  opus-4-8   36.7M · $45
-Models · today
-  fable-5     5.2M · $11.07
-  opus-4-8    4.7M · $5.44
+Weekly by model
+  Fable    ░░░░░░░░░░   2%
 ```
 
-**Read the two bars together:** if the `⏱` (time) bar is longer than the `5h` (usage) bar, you're under pace — plenty left. If usage pulls ahead of time, the header flips to **Burning fast** / **Slow down** / **Hold**.
+**Read the two bars together:** if the `⏱` (time) bar is longer than the usage bar, you're under pace. If usage pulls ahead of time, the header flips to **⚡ Burning fast** → **⚠️ Slow down** → **🛑 Hold**.
 
-## How limits are estimated
+## How it works
 
-There's no public token cap for a subscription, so the "ceiling" is derived from **your own history**:
-
-- **5h cap** = your heaviest completed 5-hour block ever.
-- **7d cap** = your heaviest rolling 7-day span ever.
-
-Since Anthropic cuts you off around your heaviest block, this is a close proxy for the real limit — and it self-corrects as you use more.
+- Reads the OAuth token from your macOS Keychain (`Claude Code-credentials`).
+- Calls `GET /api/oauth/usage` — the **same source as `/usage`**, so `five_hour` / `seven_day` percentages match exactly.
+- When the access token nears expiry, it **refreshes automatically** (rotating refresh token, written back to the Keychain) — so you only `claude login` once.
+- Caches the response for **15 minutes**, so polling never triggers a rate limit.
+- If you're not logged in, it falls back to a local ccusage token estimate and prompts you to log in.
 
 ## Features
 
+- **Exact numbers** — matches `/usage` (real 5h/7d limits, not an estimate).
+- **Self-refreshing auth** — log in once, runs indefinitely.
 - **Dual bars** — usage vs. time-through-window, so you see pace at a glance.
-- **Per-model breakdown** — tokens + cost for last 7 days and today.
-- **Reset notification** — a macOS alert fires when a new 5-hour block starts (fresh quota).
+- **Per-model weekly** — scoped limits (e.g. Fable) straight from the API.
+- **Reset notification** — a macOS alert fires when the 5-hour window resets.
 - **Light/dark aware** — colors adapt to your menu bar appearance.
-- **Never rate-limited** — all data comes from local logs, zero network.
+- **Rate-limit safe** — 15-min cache, so it never hammers the endpoint.
 
 ## Requirements
 
-macOS · [Homebrew](https://brew.sh) · Node · [Claude Code](https://claude.ai/download)
+macOS · [Homebrew](https://brew.sh) · Node · [Claude Code](https://claude.ai/download) — logged in (`claude login`).
 
 The installer handles SwiftBar, ccusage, the plugin, and launch-at-login for you.
 
