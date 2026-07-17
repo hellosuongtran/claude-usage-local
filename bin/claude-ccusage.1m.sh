@@ -72,6 +72,10 @@ def refresh(o):
     o["accessToken"]  = d["access_token"]
     o["refreshToken"] = d.get("refresh_token", o["refreshToken"])
     o["expiresAt"]    = int((time.time() + d.get("expires_in", 28800)) * 1000)
+    # stash the rotated token FIRST (survives even if keychain write is blocked),
+    # then persist to keychain — the source of truth Claude Code also reads.
+    try: json.dump({"claudeAiOauth": o}, open(os.path.join(DIR,"oauth-backup.json"),"w"))
+    except Exception: pass
     kc_write(o)
     return o
 
@@ -81,15 +85,23 @@ def get_token():
         return None, "not_logged_in"
     if o.get("expiresAt", 0)/1000 > time.time() + 120:
         return o["accessToken"], "ok"
-    # expired/near — refresh under a soft lock (avoid concurrent double-refresh)
+    # expired/near — refresh under an EXCLUSIVE lock so concurrent SwiftBar
+    # ticks can't both consume the single-use refresh token (that breaks the
+    # chain and forces re-login — the bug this replaces).
+    import fcntl
+    lockf = open(LOCK, "w")
     try:
-        if os.path.exists(LOCK) and time.time() - os.path.getmtime(LOCK) < 30:
-            return o["accessToken"], "ok"   # another run is refreshing; use current
-        open(LOCK,"w").write("1")
-        o = refresh(o)
+        fcntl.flock(lockf, fcntl.LOCK_EX)      # wait until we alone hold it
+        o = kc_read()                           # re-read: a peer may have just refreshed
+        if o and o.get("expiresAt", 0)/1000 > time.time() + 120:
+            return o["accessToken"], "ok"
+        o = refresh(o)                          # persists new access+refresh to keychain
         return o["accessToken"], "ok"
     except Exception:
-        return o.get("accessToken"), "refresh_failed"
+        return (o or {}).get("accessToken"), "refresh_failed"
+    finally:
+        try: fcntl.flock(lockf, fcntl.LOCK_UN); lockf.close()
+        except Exception: pass
 
 def fetch_usage(token):
     p = subprocess.run(["curl","-s","--max-time","10",
@@ -195,19 +207,31 @@ if data and isinstance(data, dict) and data.get("five_hour"):
     print(f"Live tokens (Terminal) | bash='{SELF}' param1=--live terminal=true")
     sys.exit(0)
 
-# ================= FALLBACK (ccusage local) =================
+# ================= FALLBACK (ccusage local estimate) =================
+# Always render a usable bar so the menu bar is never blank.
 try: dd = json.loads(DAILY)
 except Exception: dd = {}
-msg = {"not_logged_in":"Not logged in — run: claude login",
-       "refresh_failed":"Token refresh failed — run: claude login",
-       "fetch_failed":"Usage fetch failed (offline?)"}.get(state, "Loading…")
+msg = {"not_logged_in":"Not logged in",
+       "refresh_failed":"Session expired",
+       "fetch_failed":"Offline — showing local estimate"}.get(state, "Loading…")
+hint = state in ("not_logged_in","refresh_failed")
 daily = dd.get("daily", [])
 def eff_day(d): return d.get("inputTokens",0)+d.get("outputTokens",0)+d.get("cacheCreationTokens",0)
-wu = sum(eff_day(d) for d in daily[-7:])
-print(f"⛁ local | font=Menlo-Bold size=13 color={DIM}")
+dt = [eff_day(d) for d in daily]
+wu = sum(dt[-7:])
+wcap = max((sum(dt[i:i+7]) for i in range(max(1,len(dt)-6))), default=wu) or wu
+wpct = 100*wu/wcap if wcap else 0
+
+print(f"⛁ ~{wpct:.0f}% | font=Menlo-Bold size=13 color={col(wpct)}")
 print("---")
-print(f"{msg} | font=Menlo size=12 color={YELLOW}")
-print(f"Showing local estimate (7d eff): {wu/1e6:.1f}M tok | font=Menlo size=11 color={DIM}")
+print(f"Claude Usage · {msg} (estimate) | font=Menlo-Bold size=12 color={YELLOW}")
+print(f"  7d  {make_bar(wpct)} | font=Menlo size=12 color={col(wpct)}")
+print(f"  {wu/1e6:.1f}M / {wcap/1e6:.1f}M tok · local estimate | font=Menlo size=11 color={DIM}")
+if hint:
+    print("---")
+    print(f"⚠️ Real % needs login. In Terminal run: | font=Menlo size=11 color={DIM}")
+    print(f"claude login | font=Menlo size=12 color={BLUE} bash=claude param1=login terminal=true")
 print("---")
-print(f"Retry | bash='{SELF}' param1=--force terminal=false refresh=true")
+print(f"Retry now | bash='{SELF}' param1=--force terminal=false refresh=true")
+print(f"Live tokens (Terminal) | bash='{SELF}' param1=--live terminal=true")
 PY
