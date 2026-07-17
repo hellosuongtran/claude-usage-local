@@ -49,13 +49,25 @@ def kc_read():
     except Exception:
         return None
 
-def kc_write(o):
+def kc_read_account():
     try:
-        creds = {"claudeAiOauth": o}
-        subprocess.run(["security","add-generic-password","-U","-s","Claude Code-credentials",
-                        "-a", os.environ.get("USER","")], input=json.dumps(creds),
-                       capture_output=True, text=True, timeout=5, check=True)
-        return True
+        out = subprocess.run(["security","find-generic-password","-s","Claude Code-credentials"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if '"acct"' in line:
+                return line.split('="',1)[1].rstrip('"')
+    except Exception: pass
+    return os.environ.get("USER","")
+
+def kc_write(o):
+    # -w <blob> is REQUIRED: without it `security` ignores the new password and
+    # the update silently no-ops (rc 0) — the bug that broke the refresh chain.
+    try:
+        blob = json.dumps({"claudeAiOauth": o})
+        r = subprocess.run(["security","add-generic-password","-U",
+                            "-s","Claude Code-credentials","-a", kc_read_account(),
+                            "-w", blob], capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
     except Exception:
         return False
 
